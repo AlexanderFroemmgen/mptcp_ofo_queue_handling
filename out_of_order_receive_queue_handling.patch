@@ -1,0 +1,238 @@
+diff --git a/include/net/mptcp.h b/include/net/mptcp.h
+index 67795bd..a428df2 100644
+--- a/include/net/mptcp.h
++++ b/include/net/mptcp.h
+@@ -644,6 +644,7 @@ extern int sysctl_mptcp_enabled;
+ extern int sysctl_mptcp_checksum;
+ extern int sysctl_mptcp_debug;
+ extern int sysctl_mptcp_syn_retries;
++extern int sysctl_mptcp_ofo_receive_opt;
+ 
+ extern struct workqueue_struct *mptcp_wq;
+ 
+diff --git a/net/mptcp/mptcp_ctrl.c b/net/mptcp/mptcp_ctrl.c
+index f8e5c2e..567c5cc 100644
+--- a/net/mptcp/mptcp_ctrl.c
++++ b/net/mptcp/mptcp_ctrl.c
+@@ -67,6 +67,7 @@ int sysctl_mptcp_checksum __read_mostly = 1;
+ int sysctl_mptcp_debug __read_mostly;
+ EXPORT_SYMBOL(sysctl_mptcp_debug);
+ int sysctl_mptcp_syn_retries __read_mostly = 3;
++int sysctl_mptcp_ofo_receive_opt __read_mostly = 0;
+ 
+ bool mptcp_init_failed __read_mostly;
+ 
+@@ -141,6 +142,13 @@ static struct ctl_table mptcp_table[] = {
+ 		.proc_handler = &proc_dointvec
+ 	},
+ 	{
++		.procname = "mptcp_ofo_receive_opt",
++		.data = &sysctl_mptcp_ofo_receive_opt,
++		.maxlen = sizeof(int),
++		.mode = 0644,
++		.proc_handler = &proc_dointvec
++	},
++	{
+ 		.procname	= "mptcp_path_manager",
+ 		.mode		= 0644,
+ 		.maxlen		= MPTCP_PM_NAME_MAX,
+diff --git a/net/mptcp/mptcp_input.c b/net/mptcp/mptcp_input.c
+index 99e837fe..1a58dd0 100644
+--- a/net/mptcp/mptcp_input.c
++++ b/net/mptcp/mptcp_input.c
+@@ -870,6 +870,10 @@ static int mptcp_validate_mapping(struct sock *sk, struct sk_buff *skb)
+ 	return 0;
+ }
+ 
++/* Checks ofo-queues of all subflows except not_sk if something from
++ * the subflows ofo-queue fits into the meta-rcv-queue */
++void mptcp_push_subflows_ofo_queues_to_meta_rcv(struct sock *meta_sk, struct sock *not_sk);
++
+ /* @return: 0  everything is fine. Just continue processing
+  *	    1  subflow is broken stop everything
+  *	    -1 this mapping has been put in the meta-receive-queue
+@@ -996,6 +1000,12 @@ static int mptcp_queue_skb(struct sock *sk)
+ 			if (!skb_queue_empty(&meta_tp->out_of_order_queue))
+ 				mptcp_ofo_queue(meta_sk);
+ 
++			if (sysctl_mptcp_ofo_receive_opt) {
++				/* Whenever we check the meta-ofo-queue, we should check all
++				 * subflow ofo-queues as well. */
++				mptcp_push_subflows_ofo_queues_to_meta_rcv(meta_sk, sk);
++			}
++
+ 			if (eaten)
+ 				kfree_skb_partial(tmp1, fragstolen);
+ 
+@@ -1014,6 +1024,156 @@ next:
+ 	return data_queued ? -1 : -2;
+ }
+ 
++void mptcp_push_subflow_ofo_queue_to_meta_rcv(struct sock *sk) {
++	struct tcp_sock *tp = tcp_sk(sk), *meta_tp = mptcp_meta_tp(tp);
++	struct sock *meta_sk = mptcp_meta_sk(sk);
++	struct sk_buff *tmp, *skb;
++
++	if (skb_queue_empty(&tp->out_of_order_queue)) {
++		mptcp_debug("%s checks subflow %p which has %u packets in the ofo queue\n", __func__, sk, tp->out_of_order_queue.qlen);
++        
++		/*
++		 * There might be packets with a lower data_seq but a higher subflow_seq:
++         * Traverse the ofo queue as long as i) matching packets are found and we
++         * notice out of order data_seq values.
++		 */
++		while(true) {
++            u32 last_data_seq = 0;
++			bool out_of_order_data_seq = false;
++			bool matched = false;
++ 
++            skb_queue_walk_safe(&tp->out_of_order_queue, skb, tmp)
++            {
++                u32 *ptr;
++                u32 data_seq, sub_seq, data_len;
++
++                /* No mapping here? For a first version, we only accept packets with mapping */
++                if (!mptcp_is_data_seq(skb)) {
++                    mptcp_debug("%s: skip ofo packet with seq %x and end_seq %x\n", __func__, TCP_SKB_CB(skb)->seq, TCP_SKB_CB(skb)->end_seq);
++                    continue;
++                }
++
++                /* Calculate sequence numbers and mappings */
++                ptr = mptcp_skb_set_data_seq(skb, &data_seq, NULL);
++                ptr++;
++                sub_seq = get_unaligned_be32(ptr) + tp->mptcp->rcv_isn;
++                ptr++;
++                data_len = get_unaligned_be16(ptr);
++
++                if(!before(last_data_seq, data_seq)) {
++                    out_of_order_data_seq = true;
++                }
++
++                if (before(meta_tp->rcv_nxt, data_seq)) {
++                    /*
++                     * Segment does not fit in the meta-rcv-queue,
++                     * but has to go to the meta-ofo-queue
++                     *
++                     * Design decision:
++                     * 
++                     * We do not put the packet in the meta-ofo-queue, as most packets in 
++                     * heterogeneous networks would go there.
++                     * 
++                     * Instead, we check again whenever we get new packets.
++                     */
++                } else {
++                    /* Packet is ready for the meta-rcv-queue
++                     *
++                     * Design decision: 
++                     *
++                     * Keep all packets in the subflow receive queue (i.e., no unlinking) 
++                     * and copy the packets for the meta_receive_queue to keep changes 
++                     * in the remaining receive packet handling minimal.
++                     */
++                     
++                    bool eaten = false;
++                    bool fragstolen = false;
++                    struct sk_buff* skb_cpy = NULL;
++                    u32 data_end_seq = data_seq + data_len;
++    
++                    /* already fully in the meta_receive_queue? */
++                    if (!after(data_end_seq , meta_tp->rcv_nxt)) {
++                        continue;
++                    }
++
++                    skb_cpy = pskb_copy_for_clone(skb, GFP_ATOMIC);
++
++                    /* This code is just best effort, no need to fail hard */
++                    if(!skb_cpy) {
++                        return;
++                    }
++
++                    matched = true;
++
++                    /* Adapt data-seq's to the packet itself. We kinda transform the
++                     * dss-mapping to a per-packet granularity. This is necessary to
++                     * correctly handle overlapping mappings coming from different
++                     * subflows. Otherwise it would be a complete mess.
++                     * 
++                     * This code is inspired by prepare_skb. Should we refactor this to 
++                     * a function?
++                     */
++                     
++                    TCP_SKB_CB(skb_cpy)->seq = data_seq;
++                    TCP_SKB_CB(skb_cpy)->end_seq = data_end_seq;
++
++                    /* Is direct copy possible ? */
++                    if (TCP_SKB_CB(skb_cpy)->seq == meta_tp->rcv_nxt &&
++                        meta_tp->ucopy.task == current &&
++                        meta_tp->copied_seq == meta_tp->rcv_nxt &&
++                        meta_tp->ucopy.len && sock_owned_by_user(meta_sk)) {
++
++                        eaten = mptcp_direct_copy(skb_cpy, meta_sk);
++                    }
++
++                    if (meta_tp->mpcb->in_time_wait) { /* In time-wait, do not receive data */
++                        eaten = 1;
++                    }
++
++                    if (!eaten) {
++                        eaten = tcp_queue_rcv(meta_sk, skb_cpy, 0, &fragstolen);
++                    }
++
++                    meta_tp->rcv_nxt = TCP_SKB_CB(skb_cpy)->end_seq;
++
++                    // TODO: do we need this? 
++                    //mptcp_check_rcvseq_wrap(meta_tp, old_rcv_nxt);
++
++                    /* Check if this fills a gap in the ofo queue */
++                    if (!skb_queue_empty(&meta_tp->out_of_order_queue))
++                        mptcp_ofo_queue(meta_sk);
++                    
++                    /* Whenever we check the meta-ofo-queue, we should check all
++                     * subflow ofo-queues as well. */
++                    mptcp_push_subflows_ofo_queues_to_meta_rcv(meta_sk, sk);
++                } 
++            }
++
++            mptcp_debug("%s: matched and saw out of order data seq numbers %u\n", __func__);
++            
++			if(!matched)
++				break;
++			if(!out_of_order_data_seq)
++				break;
++		}
++	}
++}
++
++/* Checks ofo-queues of all subflows except not_sk if something from
++ * the subflows ofo-queue fits into the meta-rcv-queue */
++void mptcp_push_subflows_ofo_queues_to_meta_rcv(struct sock *meta_sk, struct sock *not_sk) {
++	struct sock *sk;
++	struct mptcp_cb *mpcb = tcp_sk(meta_sk)->mpcb;
++
++	mptcp_for_each_sk(mpcb, sk) {
++		if(sk == not_sk)
++			continue;
++		if(skb_queue_empty(&tcp_sk(sk)->out_of_order_queue)) {
++			mptcp_push_subflow_ofo_queue_to_meta_rcv(sk);
++		}
++	}
++}
++
+ void mptcp_data_ready(struct sock *sk)
+ {
+ 	struct sock *meta_sk = mptcp_meta_sk(sk);
+@@ -1070,6 +1230,14 @@ restart:
+ 		}
+ 	}
+ 
++    /* 
++     * In the previous loop, out-of-order packets 
++     * wrt the subflow sequence number are not
++     * pushed to the meta socket.
++     */ 
++    if (sysctl_mptcp_ofo_receive_opt) {
++        mptcp_push_subflow_ofo_queue_to_meta_rcv(sk);
++    }
+ exit:
+ 	if (tcp_sk(sk)->close_it) {
+ 		tcp_send_ack(sk);
